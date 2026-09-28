@@ -1,77 +1,119 @@
 # Crypto Data Platform
 
-An end-to-end, containerized data engineering pipeline that ingests real-time cryptocurrency and market sentiment data, stages it, loads it into a cloud data warehouse, and transforms it into a dimensional model ready for analytics.
+An end-to-end, containerized data platform that ingests cryptocurrency and market sentiment data through **two parallel pipelines** — a scheduled batch pipeline and a real-time streaming pipeline — each feeding a purpose-built destination, with a live dashboard on top of both and CI/CD checks on every push.
 
 ## Architecture
 
 ```
-CoinGecko API ─┐
-                ├─→ Airflow (batch, every 10 min) ─→ PostgreSQL (staging) ─→ BigQuery (raw) ─→ dbt ─→ Star Schema
-alternative.me ─┘        (Docker)                       (Docker)          (partitioned/clustered)   (BigQuery)
-   (Fear & Greed)
+BATCH (Airflow, two DAGs)
+
+  CoinGecko API  ──►  crypto_pipeline DAG (every 10 min)
+                        → PostgreSQL (staging) → BigQuery raw_crypto_data ──┐
+                                                                            │
+  alternative.me ──►  fear_greed_pipeline DAG (daily)                       │
+   (Fear & Greed)       → PostgreSQL (staging) → BigQuery raw_fear_greed ───┤
+                                                                            ▼
+                        dbt → Star Schema (dim_coin, dim_date,
+                              fact_crypto_prices, fact_fear_greed)
+
+                    ┌───────────────────── STREAMING ──────────────────────┐
+CoinGecko API ──────┤  Kafka Producer (every 30s) → Kafka topic            │
+                     │        → PySpark Structured Streaming               │
+                     │        → PostgreSQL (live_crypto_data, UPSERT)      │
+                     └────────────────────────────────────────────────────┘
+
+                     Streamlit Dashboard (Live tab + Historical tab)
+                     reading from both destinations
 ```
 
-**Layers:**
-1. **Ingestion** — Python scripts fetch from the CoinGecko API (50 top coins, every 10 minutes) and the alternative.me Fear & Greed Index API (daily), orchestrated by Apache Airflow.
-2. **Staging** — Raw ingested data lands in PostgreSQL first. This decouples ingestion from the warehouse, provides a fast landing zone for frequent writes, and allows replay without re-hitting rate-limited APIs.
-3. **Warehouse (raw layer)** — A batch Airflow task loads new rows from Postgres into partitioned, clustered BigQuery tables (`raw_crypto_data`, `raw_fear_greed`), using a watermark (`ingested_at` / `fetch_date`) to avoid reloading old data.
-4. **Transformation** — dbt builds a staging layer (light cleaning/typing) on top of the raw tables, then a dimensional (star schema) model on top of that.
-5. **Orchestration** — Two Airflow DAGs (`crypto_pipeline`, `fear_greed_pipeline`) run the full chain: ingest → load to warehouse → dbt run → dbt test.
+Everything runs in Docker containers — Airflow (with dbt installed), PostgreSQL, Kafka, Zookeeper, and Spark (master + worker) — orchestrated via Docker Compose.
 
-All of the above runs in Docker containers (Airflow, PostgreSQL, and — for the streaming extension — Kafka, Zookeeper, and Spark), orchestrated via Docker Compose.
+## Why two pipelines, not one
 
-## Dimensional Model
+The batch and streaming paths intentionally answer **different questions** and write to **different destinations** — this was a deliberate design choice, not two versions of the same thing:
+
+- **Batch → BigQuery** answers "how has this changed over time" — historical, aggregated, analytical. This is what a data warehouse is built for.
+- **Streaming → PostgreSQL (UPSERT)** answers "what is it right now" — a single current-state row per coin, overwritten on every update, never growing. This is a point-lookup problem, not an analytical-scan problem, so it deliberately does **not** feed BigQuery — querying a warehouse for "give me the latest value" at high frequency is the wrong tool for that job.
+
+## Dimensional Model (batch)
 
 **Dimensions:**
-- `dim_coin` — one row per coin, with a hashed surrogate key (`coin_key`) generated from the natural key (`coin_id`)
-- `dim_date` — a generated calendar spine (2026), with a surrogate key (`date_key`) and derived attributes (day of week, month name, etc.)
+- `dim_coin` — one row per coin, with a hashed surrogate key (`coin_key`)
+- `dim_date` — a generated calendar spine, with a surrogate key (`date_key`)
 
 **Facts:**
-- `fact_crypto_prices` — grain: **one row per coin, per ingestion timestamp**. Price, market cap, and volume, joined to `dim_coin` and `dim_date` via surrogate keys.
-- `fact_fear_greed` — grain: **one row per calendar day**. Market-wide sentiment score, joined to `dim_date` only (not coin-specific).
+- `fact_crypto_prices` — grain: **one row per coin, per ingestion timestamp**
+- `fact_fear_greed` — grain: **one row per calendar day**
 
-Kept as two separate fact tables rather than one combined table, since they have different natural grains (10-minute vs. daily) — joining them at the wrong grain would silently duplicate the daily sentiment score across every price row for that day.
+Kept as two separate fact tables since they have different natural grains (10-minute vs. daily); combining them would silently duplicate the daily sentiment score across every price row for that day.
+
+## Data Retention
+
+`raw_fear_greed` in BigQuery holds the full history returned by the alternative.me API — every value is present and none are dropped or expired by the BigQuery sandbox tier. Loads use a `fetch_date` watermark, so each run only appends days newer than what the table already holds.
+
+## Streaming Pipeline
+
+```
+CoinGecko API → Kafka producer (polls every 30s) → Kafka topic (crypto_prices)
+              → PySpark Structured Streaming consumer (schema-validated JSON parsing)
+              → PostgreSQL live_crypto_data (INSERT ... ON CONFLICT (id) DO UPDATE)
+```
+
+- CoinGecko's API is poll-based, not push-based — "streaming" here means frequent polling treated as a message stream, not true event-driven push streaming. This is a deliberate, stated design choice.
+- `live_crypto_data` uses `id` as its primary key, so every new message **overwrites** the existing row for that coin rather than appending — the table stays at a fixed size (one row per tracked coin) and always reflects the latest known price.
+- The producer runs as its own long-lived Docker service, decoupled from Airflow — Airflow orchestrates scheduled batch work; the producer is a continuously-running process, which is a different operational pattern and intentionally kept separate.
+
+## Dashboard
+
+A single Streamlit app with two tabs:
+- **Live Prices** — auto-refreshes every 5 seconds, reads directly from `live_crypto_data` in PostgreSQL
+- **Historical Analysis** — reads from the BigQuery star schema, lets you select a coin and view its price trend over time, cached for 5 minutes since historical data doesn't need per-second freshness
+
+## CI/CD
+
+A GitHub Actions workflow runs automatically on every push, so broken changes are caught before they reach the running pipelines. Checks include:
+- **Python syntax validation** — catches Python errors before they reach Airflow or the streaming pipeline
+- **Docker image builds** — verifies the Airflow, producer, and Spark images can be built successfully
+- **`docker compose config` validation** — catches YAML, interpolation, and configuration errors in the Compose file
+
+Credentials never live in the repo: secrets are loaded from a git-ignored `.env` file locally, and a `.env.example` documents the variables required.
+
+Deployment is intentionally out of scope — this is a solo project running locally, with no staging or production servers to deploy to.
 
 ## Design Decisions & Trade-offs
 
-- **Surrogate keys over natural keys** — `coin_key`/`date_key` are hashed via `dbt_utils.generate_surrogate_key()` rather than joining on raw `coin_id`/dates directly. This insulates the model from upstream ID changes and is standard Kimball-style dimensional modeling practice.
-- **PostgreSQL as a staging layer, not the warehouse** — Postgres is optimized for frequent small writes (ingestion); BigQuery is optimized for large analytical scans. Using each for what it's good at, rather than one tool for everything.
-- **Sandbox BigQuery limitations** — this project runs on BigQuery's free sandbox tier (no billing account). This enforces a **60-day partition expiration** on tables, meaning `raw_fear_greed` cannot retain more than ~60 days of history without billing enabled. In a production setting with billing on, this would be configured for full retention.
-- **Pandas over PySpark for the batch load** — at this data volume (tens to hundreds of rows per run), pandas is simpler and entirely adequate. PySpark is reserved for the streaming layer (below), where it's the right tool for continuous, higher-throughput processing.
-- **NUMERIC → FLOAT64** — BigQuery's `NUMERIC` type caused repeated `pyarrow`/`Decimal` conversion failures when loading from pandas DataFrames (a known friction point in the pandas → pyarrow → BigQuery pipeline). Price/volume columns were changed to `FLOAT64`, which is adequate precision for this analytical use case.
-
-## Streaming Extension (in progress)
-
-A real-time ingestion path is being layered in alongside the batch pipeline, using Kafka and PySpark Structured Streaming:
-
-```
-CoinGecko API → Kafka producer (frequent polling) → Kafka topic → PySpark Structured Streaming consumer → Postgres (live table)
-```
-
-Note: CoinGecko's free API is poll-based, not push-based — "streaming" here means significantly more frequent polling treated as a message stream, not true event-driven push streaming. This is an intentional, explicit design choice, not a limitation being glossed over.
-
-The streaming path is designed to answer a different question than the batch path: "what's happening right now" (low-latency point lookups) vs. "what happened over time" (historical, aggregated analysis) — and is intended to land in its own serving table/dashboard rather than being merged into the batch tables.
+- **Surrogate keys over natural keys** — `coin_key`/`date_key` are hashed via `dbt_utils.generate_surrogate_key()` rather than joining on raw `coin_id`/dates directly, insulating the model from upstream ID changes (standard Kimball-style dimensional modeling).
+- **PostgreSQL as a staging layer, not the warehouse** — optimized for frequent small writes (ingestion); BigQuery is optimized for large analytical scans. Each tool used for what it's good at.
+- **PostgreSQL (UPSERT) over Redis for the live-price store** — Redis is the more common production choice for this pattern, but at this scale, a Postgres table with `ON CONFLICT DO UPDATE` achieves the same result without introducing a new piece of infrastructure. Worth noting as a scaling trade-off, not an oversight.
+- **Pandas over PySpark for the batch load** — at batch's data volume (tens to hundreds of rows per run), pandas is simpler and adequate. PySpark is reserved for the streaming layer, where it's the right tool for continuous processing.
+- **NUMERIC → FLOAT64** — BigQuery's `NUMERIC` type caused repeated `pyarrow`/`Decimal` conversion failures loading from pandas DataFrames. Price/volume columns were changed to `FLOAT64`, adequate precision for this analytical use case.
 
 ## Known Limitations / Not Yet Production-Grade
 
 This project demonstrates the *architecture* of a production pipeline but is missing several things a real production system would need:
-- No alerting (Slack/email/PagerDuty on failure)
+- No alerting on streaming pipeline failures (batch has email alerts; streaming does not yet)
+- No consumer lag monitoring for Kafka
 - No monitoring/observability dashboards (pipeline health, data freshness, anomaly detection)
-- Secrets (GCP key, DB credentials) are stored as local files/env vars, not in a secrets manager
-- No CI/CD for pipeline code changes
 - No dev/staging/prod environment separation
 - No tested backfill/reprocessing strategy
-- Running on BigQuery's sandbox tier (no billing), which caps partition retention at 60 days
+- Runs on BigQuery's free sandbox tier (no billing account)
+- The Spark streaming consumer is run manually via `spark-submit`, not as a persistent service — unlike the producer, which runs continuously in its own container
 
 ## Tech Stack
 
-Python · Apache Airflow · PostgreSQL · Google BigQuery · dbt · Docker & Docker Compose · Apache Kafka · Apache Spark (PySpark) · Streamlit
+Python · Apache Airflow · PostgreSQL · Google BigQuery · dbt · Docker & Docker Compose · Apache Kafka · Apache Spark (PySpark Structured Streaming) · Streamlit · GitHub Actions
 
 ## Local Setup
 
 ```bash
+cp .env.example .env   # fill in your own credentials
 docker compose up -d --build
 ```
 
 Airflow UI: `localhost:8080`
-Trigger a DAG manually: `docker exec -it airflow airflow dags trigger crypto_pipeline`
+Trigger a batch DAG manually: `docker exec -it airflow airflow dags trigger crypto_pipeline`
+
+Run the dashboard:
+```bash
+streamlit run streaming/dashboard.py
+```

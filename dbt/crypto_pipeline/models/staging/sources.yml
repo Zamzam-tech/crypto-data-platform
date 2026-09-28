@@ -1,0 +1,11 @@
+version: 2
+sources:
+  - name: crypto_data
+    description: "Raw cryptocurrency data ingested from CoinGecko API and alternative.me"
+    database: crypto-pipeline-project-500308
+    schema: crypto_raw
+    tables:
+      - name: raw_crypto_data
+        description: "Raw CoinGecko price data"
+      - name: raw_fear_greed
+        description: "Raw Fear & Greed Index data from alternative.me"

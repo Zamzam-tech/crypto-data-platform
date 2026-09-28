@@ -1,0 +1,9 @@
+FROM python:3.10-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir kafka-python requests
+
+COPY streaming/kafka_producer.py .
+
+CMD ["python", "-u","kafka_producer.py"]

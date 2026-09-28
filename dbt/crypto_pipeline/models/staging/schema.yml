@@ -1,0 +1,49 @@
+version: 2
+
+models:
+  - name: stg_coins
+    description: "Staging model for raw crypto data from CoinGecko"
+    columns:
+      - name: coin_id
+        description: "Unique identifier for each cryptocurrency"
+        tests:
+          - not_null
+      - name: symbol
+        description: "Ticker symbol (e.g. BTC)"
+        tests:
+          - not_null
+      - name: current_price
+        description: "Current price in USD"
+        tests:
+          - not_null
+      - name: market_cap
+        description: "Market capitalization in USD"
+        tests:
+          - not_null
+      - name: total_volume
+        description: "24hr trading volume in USD"
+        tests:
+          - not_null
+      - name: last_updated
+        tests:
+          - not_null
+      - name: ingested_at
+        tests:
+          - not_null
+
+  - name: stg_fear_greed
+    description: "Staging model for Fear & Greed Index from alternative.me"
+    columns:
+      - name: fear_greed_score
+        description: "Score from 0-100"
+        tests:
+          - not_null
+      - name: classification
+        description: "Classification e.g. Extreme Fear, Greed"
+        tests:
+          - not_null
+      - name: fetch_date
+        description: "Date the score was recorded"
+        tests:
+          - not_null
+          - unique
